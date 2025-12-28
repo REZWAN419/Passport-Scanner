@@ -3,6 +3,7 @@ import numpy as np
 import math
 import pytesseract
 import easyocr
+from concurrent.futures import ThreadPoolExecutor
 
 # ============================================================
 # ▶️ DEBUG UTILITY
@@ -13,9 +14,21 @@ def debug_show(win, img, w=350, h=250):
     cv2.resizeWindow(win, w, h)
     cv2.imshow(win, img)
 
-# ================================
-# FAST ROTATE IMAGE BY TEXT GEOMETRY
-# ================================
+# =============================================
+# ROTATE IMAGE BY TEXT GEOMETRY
+# =============================================
+
+# PROJECTION VARIANCE FOR A SINGLE ANGLE
+def angle_score(angle, bw):
+    h, w = bw.shape
+    M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
+    rotated_bw = cv2.warpAffine(bw, M, (w, h),
+                                flags=cv2.INTER_CUBIC,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    hist = np.sum(rotated_bw, axis=1)
+    return np.var(hist)
+
+
 def rotate_image_by_text_geometry(image_path):
     img = cv2.imread(image_path)
     if img is None:
@@ -25,7 +38,7 @@ def rotate_image_by_text_geometry(image_path):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     # Downscale image for speed
-    scale = 0.25  # 25% size
+    scale = 0.25
     small_gray = cv2.resize(gray, (0, 0), fx=scale, fy=scale)
     bw = cv2.adaptiveThreshold(small_gray, 255,
                                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -35,29 +48,20 @@ def rotate_image_by_text_geometry(image_path):
     debug_show("Original", img)
     debug_show("Binarized (downscaled)", bw)
 
-    # 1️⃣ Coarse search (every 2°)
+    # ----------------------------
+    # Coarse search (0-180°) in parallel
+    # ----------------------------
     coarse_angles = np.arange(0, 180, 2.0)
-    coarse_scores = []
-    h, w = bw.shape
-    for angle in coarse_angles:
-        M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
-        rotated_bw = cv2.warpAffine(bw, M, (w, h),
-                                    flags=cv2.INTER_CUBIC,
-                                    borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        hist = np.sum(rotated_bw, axis=1)
-        coarse_scores.append(np.var(hist))
+    with ThreadPoolExecutor() as executor:
+        coarse_scores = list(executor.map(lambda a: angle_score(a, bw), coarse_angles))
     coarse_best_angle = coarse_angles[np.argmax(coarse_scores)]
 
-    # 2️⃣ Fine search ±2° around coarse angle with 0.1° steps
+    # ----------------------------
+    # Fine search ±2° around coarse angle in parallel
+    # ----------------------------
     fine_angles = np.arange(coarse_best_angle-2, coarse_best_angle+2, 0.1)
-    fine_scores = []
-    for angle in fine_angles:
-        M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
-        rotated_bw = cv2.warpAffine(bw, M, (w, h),
-                                    flags=cv2.INTER_CUBIC,
-                                    borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        hist = np.sum(rotated_bw, axis=1)
-        fine_scores.append(np.var(hist))
+    with ThreadPoolExecutor() as executor:
+        fine_scores = list(executor.map(lambda a: angle_score(a, bw), fine_angles))
     best_angle = fine_angles[np.argmax(fine_scores)]
     print(f"📊 Detected skew angle: {best_angle:.2f}°")
 
@@ -67,7 +71,7 @@ def rotate_image_by_text_geometry(image_path):
     rotated = cv2.warpAffine(img, M_final, (w_full, h_full),
                              flags=cv2.INTER_CUBIC,
                              borderMode=cv2.BORDER_REPLICATE)
-
+    
     debug_show("6 - Rotated Result", rotated)
 
     cv2.waitKey(0)
@@ -204,7 +208,7 @@ def detect_mrz_orientation_and_crop(page):
 # ▶️ RUN ENTIRE PIPELINE FOR SINGLE PAGE
 # ============================================================
 
-image_path = r"C:\Users\Lenovo\OneDrive\Desktop\Passport Scanner\PassportIMG\Screenshot5.png"  #tilted.jpg Screenshot1.png
+image_path = r"C:\Users\Lenovo\OneDrive\Desktop\Passport Scanner\PassportIMG\Screenshot1.png"  #tilted.jpg Screenshot1.png
 
 rotated = rotate_image_by_text_geometry(image_path)
 page = detect_document_candidate_debug(rotated)
@@ -250,9 +254,9 @@ DEBUG_NON_MRZ_MARGIN_CROP = True
 
 # TUNING KNOBS (PERCENTAGES)
 CROP_LEFT_RATIO   = 0.28   # remove 30% from left (portrait side)
-CROP_TOP_RATIO    = 0.40   # remove 10% from top
-CROP_RIGHT_RATIO  = 0.10   # remove 5% from right
-CROP_BOTTOM_RATIO = 0.07   # remove 5% from bottom
+CROP_TOP_RATIO    = 0.42   # remove 10% from top
+CROP_RIGHT_RATIO  = 0.08   # remove 5% from right
+CROP_BOTTOM_RATIO = 0.15   # remove 5% from bottom
 
 
 # CROP LOGIC
@@ -275,28 +279,151 @@ if DEBUG_NON_MRZ_MARGIN_CROP:
 
 
 
-
-# NON-MRZ STEP 3 — KEEP ONLY BLACK PIXELS
+# ▶️ NON-MRZ STEP 3 — WHITE FILL UNWANTED AREAS
 
 # DEBUG TOGGLE
-DEBUG_NON_MRZ_BLACK_ONLY = True
+DEBUG_NON_MRZ_WHITE_MASK = True
+
+# ------------------------------------------------------------
+# TUNING KNOBS — WHITE MASK BOXES (RATIOS)
+# Each box defined as: (x_start, y_start, width, height)
+# All values are ratios (0.0 – 1.0) relative to image size
+# ------------------------------------------------------------
+
+WHITE_MASK_BOXES = [
+    # Box 1 — example: top-left noise area
+    (0.00, 0.00, 0.35, 0.70),
+
+    # Box 2 — example: middle decorative area
+    (0.00, 0.53, 1.00, 0.21),
+
+    # Box 3 — example: bottom-left emblem/text
+    (0.90, 0.65, 0.30, 0.40),
+]
 
 
-# TUNING KNOB
-BLACK_PIXEL_MAX_INTENSITY = 80   # any pixel darker than this is black, else white
+# APPLY WHITE MASKS
+masked_non_mrz = non_mrz_cropped.copy()
+h_nm, w_nm = masked_non_mrz.shape[:2]
 
+for (rx, ry, rw, rh) in WHITE_MASK_BOXES:
+    x1 = int(rx * w_nm)
+    y1 = int(ry * h_nm)
+    x2 = int((rx + rw) * w_nm)
+    y2 = int((ry + rh) * h_nm)
 
-# CREATE BLACK-ONLY IMAGE
-# start with white image
-black_only_nm = np.ones_like(non_mrz_cropped) * 255
-
-# mask pixels where all channels are below threshold
-mask_black = np.all(non_mrz_cropped <= BLACK_PIXEL_MAX_INTENSITY, axis=2)
-black_only_nm[mask_black] = 0
-
+    cv2.rectangle(
+        masked_non_mrz,
+        (x1, y1),
+        (x2, y2),
+        (255, 255, 255),
+        thickness=-1
+    )
 
 # DEBUG VIEW
-if DEBUG_NON_MRZ_BLACK_ONLY:
-    debug_show("NON-MRZ 2 - Pure Black Pixels", black_only_nm)
+if DEBUG_NON_MRZ_WHITE_MASK:
+    debug_show("NON-MRZ 2 - White Masked Areas", masked_non_mrz)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
+
+
+# ============================================================
+# ▶️ NON-MRZ STEP 4 — PREPROCESS FOR EASYOCR
+# ============================================================
+
+# -------------------------------
+# DEBUG TOGGLE
+# -------------------------------
+DEBUG_NON_MRZ_PREOCR = True
+
+# -------------------------------
+# TUNING KNOBS
+# -------------------------------
+CLAHE_CLIP_LIMIT = 2.0      # higher = more contrast
+CLAHE_TILE_SIZE  = 8        # local region
+DENOISE_STRENGTH = 15        # 0=off, 5-12 typical
+SHARPEN_AMOUNT  = 0.7       # 0=off, 0.5-1.2 typical
+
+# -------------------------------
+# GRAYSCALE
+# -------------------------------
+nm_gray = cv2.cvtColor(masked_non_mrz, cv2.COLOR_BGR2GRAY)
+
+# -------------------------------
+# CLAHE (LOCAL CONTRAST ENHANCEMENT)
+# -------------------------------
+clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=(CLAHE_TILE_SIZE, CLAHE_TILE_SIZE))
+nm_clahe = clahe.apply(nm_gray)
+
+# -------------------------------
+# DENOISE
+# -------------------------------
+if DENOISE_STRENGTH > 0:
+    nm_denoised = cv2.fastNlMeansDenoising(nm_clahe, h=DENOISE_STRENGTH, templateWindowSize=7, searchWindowSize=21)
+else:
+    nm_denoised = nm_clahe.copy()
+
+# -------------------------------
+# LIGHT SHARPEN
+# -------------------------------
+if SHARPEN_AMOUNT > 0:
+    blur = cv2.GaussianBlur(nm_denoised, (0,0), 2.0)
+    nm_preocr = cv2.addWeighted(nm_denoised, 1+SHARPEN_AMOUNT, blur, -SHARPEN_AMOUNT, 0)
+else:
+    nm_preocr = nm_denoised.copy()
+
+# -------------------------------
+# DEBUG VIEW
+# -------------------------------
+if DEBUG_NON_MRZ_PREOCR:
+    debug_show("NON-MRZ Preprocessed for OCR", nm_preocr, w=900, h=600)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+# ============================================================
+# ▶️ EASY OCR ON PREPROCESSED IMAGE
+# ============================================================
+
+DEBUG_NON_MRZ_OCR = True
+EASYOCR_LANG     = ['en']
+EASYOCR_GPU      = False
+EASYOCR_MIN_CONF = 0.25
+EASYOCR_PARAGRAPH = False
+
+reader = easyocr.Reader(EASYOCR_LANG, gpu=EASYOCR_GPU, verbose=False)
+
+ocr_results = reader.readtext(
+    nm_preocr,
+    detail=1,
+    paragraph=EASYOCR_PARAGRAPH
+)
+
+# -------------------------------
+# DRAW DETECTIONS (DEBUG)
+# -------------------------------
+ocr_debug = cv2.cvtColor(nm_preocr, cv2.COLOR_GRAY2BGR)
+for box, text, conf in ocr_results:
+    if conf < EASYOCR_MIN_CONF:
+        continue
+    pts = np.array(box).astype(int)
+    cv2.polylines(ocr_debug, [pts], isClosed=True, color=(0,255,0), thickness=2)
+    x, y = pts[0]
+    label = f"{text} ({conf:.2f})"
+    cv2.putText(ocr_debug, label, (x, max(20,y-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+
+if DEBUG_NON_MRZ_OCR:
+    debug_show("NON-MRZ OCR Detection", ocr_debug, w=900, h=600)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+# -------------------------------
+# FINAL OCR OUTPUT
+# -------------------------------
+non_mrz_ocr_results = [(text, conf, box) for box, text, conf in ocr_results if conf >= EASYOCR_MIN_CONF]
+
+# -------------------------------
+# PRINT TO TERMINAL
+# -------------------------------
+print("📄 NON-MRZ OCR RESULTS:")
+for idx, (text, conf, box) in enumerate(non_mrz_ocr_results, start=1):
+    print(f"{idx}. {text} ({conf:.2f})")
